@@ -1,0 +1,50 @@
+{
+  "name": "@pltn/adonis-mastra-server-adapter",
+  "version": "0.1.0",
+  "description": "AdonisJS server adapter for Mastra",
+  "type": "module",
+  "license": "MIT",
+  "author": "Ivan Plotnikov",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "peerDependencies": {
+    "@adonisjs/core": ">=6.0.0",
+    "@mastra/core": ">=1.4.0",
+    "@mastra/server": ">=1.4.0",
+    "zod": ">=3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.18",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "keywords": [
+    "adonisjs",
+    "mastra",
+    "adapter"
+  ]
+}
