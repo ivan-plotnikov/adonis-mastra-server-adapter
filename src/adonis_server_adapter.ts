@@ -44,11 +44,6 @@ interface NodeResponseLike {
     writeHead(status: number, headers: Record<string, string | string[]>): void
 }
 
-interface AdonisAuthLike {
-    check(): Promise<boolean>
-    user?: unknown
-}
-
 const REQUEST_METHODS_WITH_BODY = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
 export class AdonisMastraServer extends MastraServer<HttpRouterService, HttpContext, HttpContext> {
@@ -73,24 +68,6 @@ export class AdonisMastraServer extends MastraServer<HttpRouterService, HttpCont
             const routePath = this.buildRoutePath(this.prefix, route.path)
             this.registerAdonisHandler(this.app, route.method, routePath, async (ctx) => {
                 const runtime = this.createRuntimeContext(ctx)
-                const authError = await this.checkRouteAuthWithAdonisSession(
-                    {
-                        method: route.method,
-                        path: route.path,
-                        responseType: 'json',
-                        handler: async () => null,
-                        requiresAuth: route.requiresAuth,
-                    },
-                    ctx,
-                    runtime.requestContext
-                )
-
-                if (authError) {
-                    ctx.response.status(authError.status)
-                    ctx.response.json({ error: authError.error })
-                    return
-                }
-
                 const body = REQUEST_METHODS_WITH_BODY.has(route.method)
                     ? ctx.request.body()
                     : undefined
@@ -123,18 +100,6 @@ export class AdonisMastraServer extends MastraServer<HttpRouterService, HttpCont
 
         this.registerAdonisHandler(app, route.method, fullPath, async (ctx) => {
             const runtime = this.createRuntimeContext(ctx)
-            const authError = await this.checkRouteAuthWithAdonisSession(
-                route,
-                ctx,
-                runtime.requestContext
-            )
-
-            if (authError) {
-                ctx.response.status(authError.status)
-                ctx.response.json({ error: authError.error })
-                return
-            }
-
             const maxSize = route.maxBodySize ?? this.bodyLimitOptions?.maxSize
             if (REQUEST_METHODS_WITH_BODY.has(route.method) && maxSize) {
                 const contentLength = ctx.request.header('content-length')
@@ -179,7 +144,7 @@ export class AdonisMastraServer extends MastraServer<HttpRouterService, HttpCont
             const handlerParams = {
                 ...pathParams,
                 ...queryParams,
-                ...(typeof body === 'object' && body !== null ? body : {}),
+                ...(typeof body === 'object' && true ? body : {}),
                 mastra: this.mastra,
                 requestContext: runtime.requestContext,
                 registeredTools: runtime.registeredTools,
@@ -507,64 +472,6 @@ export class AdonisMastraServer extends MastraServer<HttpRouterService, HttpCont
         const host = ctx.request.header('host') || 'localhost'
         const relativeUrl = ctx.request.url(true)
         return new URL(relativeUrl, `${protocol}://${host}`).toString()
-    }
-
-    private getQueryValue(ctx: HttpContext, name: string): string | undefined {
-        const value = ctx.request.qs()[name]
-
-        if (typeof value === 'string') {
-            return value
-        }
-
-        if (Array.isArray(value) && typeof value[0] === 'string') {
-            return value[0]
-        }
-
-        return undefined
-    }
-
-    private async checkRouteAuthWithAdonisSession(
-        route: ServerRoute,
-        ctx: HttpContext,
-        requestContext: RequestContext
-    ) {
-        const sessionUser = await this.resolveAdonisSessionUser(ctx)
-        if (sessionUser) {
-            requestContext.set('user', sessionUser)
-            return null
-        }
-
-        // Mastra's default auth check is skipped entirely when `mastra.server.auth`
-        // isn't configured. We still need to enforce route-level auth for Adonis sessions.
-        if (route.requiresAuth !== false) {
-            return { status: 401, error: 'Authentication required' }
-        }
-
-        return this.checkRouteAuth(route, {
-            path: String(ctx.request.url() || '/'),
-            method: String(ctx.request.method() || route.method),
-            getHeader: (name) => ctx.request.header(name),
-            getQuery: (name) => this.getQueryValue(ctx, name),
-            requestContext,
-        })
-    }
-
-    private async resolveAdonisSessionUser(ctx: HttpContext) {
-        try {
-            const auth = (ctx as HttpContext & { auth?: AdonisAuthLike }).auth
-            if (!auth) {
-                return null
-            }
-
-            const isAuthenticated = await auth.check()
-            if (!isAuthenticated || !auth.user) {
-                return null
-            }
-
-            return auth.user
-        } catch {
-            return null
-        }
     }
 
     private async parsePath(
