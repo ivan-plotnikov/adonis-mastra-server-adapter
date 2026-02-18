@@ -1,6 +1,6 @@
 {
   "name": "@pltn/adonis-mastra-server-adapter",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "AdonisJS server adapter for Mastra",
   "type": "module",
   "license": "MIT",
