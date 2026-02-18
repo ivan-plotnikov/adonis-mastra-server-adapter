@@ -42,19 +42,42 @@ interface NodeResponseLike {
     write(chunk: unknown): void
     end(chunk?: string): void
     writeHead(status: number, headers: Record<string, string | string[]>): void
+    setHeader?(name: string, value: string): void
 }
 
 const REQUEST_METHODS_WITH_BODY = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
+type MastraMiddlewareHandler = (
+    context: {
+        req: {
+            method: string
+            path: string
+            query: (key: string) => string | undefined
+            header: (name: string) => string | undefined
+        }
+        header: (name: string, value: string) => void
+        set: (key: string, value: unknown) => void
+        get: (key: string) => unknown
+    },
+    next: () => Promise<void>
+) => Promise<Response | void>
+
+type NormalizedMastraMiddleware = {
+    path: string
+    handler: MastraMiddlewareHandler
+}
+
 export class AdonisMastraServer extends MastraServer<HttpRouterService, HttpContext, HttpContext> {
+    private contextMiddlewares: NormalizedMastraMiddleware[] = []
+
+    private shouldCheckRouteAuth = false
+
     registerContextMiddleware(): void {
-        // Adonis router doesn't accept per-path function middleware registration like Express.
-        // Request context is created lazily inside each registered route handler.
+        this.contextMiddlewares = this.normalizeServerMiddlewares()
     }
 
     registerAuthMiddleware(): void {
-        // Auth is checked via `checkRouteAuth` inside each route handler.
-        // This preserves Mastra auth behavior without Adonis global middleware coupling.
+        this.shouldCheckRouteAuth = Boolean(this.mastra.getServer()?.auth)
     }
 
     async registerCustomApiRoutes(): Promise<void> {
@@ -66,27 +89,36 @@ export class AdonisMastraServer extends MastraServer<HttpRouterService, HttpCont
         const customRoutes = this.customApiRoutes ?? this.mastra.getServer()?.apiRoutes ?? []
         for (const route of customRoutes) {
             const routePath = this.buildRoutePath(this.prefix, route.path)
-            this.registerAdonisHandler(this.app, route.method, routePath, async (ctx) => {
-                const runtime = this.createRuntimeContext(ctx)
-                const body = REQUEST_METHODS_WITH_BODY.has(route.method)
-                    ? ctx.request.body()
-                    : undefined
-                const response = await this.handleCustomRouteRequest(
-                    this.buildAbsoluteRequestUrl(ctx),
-                    route.method,
-                    ctx.request.headers(),
-                    body,
-                    runtime.requestContext
+            this.registerAdonisHandler(
+                this.app,
+                route.method,
+                routePath,
+                this.withMastraPipeline(
+                    {
+                        requiresAuth: route.requiresAuth,
+                    },
+                    async (ctx, runtime) => {
+                        const body = REQUEST_METHODS_WITH_BODY.has(route.method)
+                            ? ctx.request.body()
+                            : undefined
+                        const response = await this.handleCustomRouteRequest(
+                            this.buildAbsoluteRequestUrl(ctx),
+                            route.method,
+                            ctx.request.headers(),
+                            body,
+                            runtime.requestContext
+                        )
+
+                        if (!response) {
+                            ctx.response.status(404)
+                            ctx.response.json({ error: 'Custom route not found' })
+                            return
+                        }
+
+                        await this.writeCustomRouteResponse(response, ctx.response.response)
+                    }
                 )
-
-                if (!response) {
-                    ctx.response.status(404)
-                    ctx.response.json({ error: 'Custom route not found' })
-                    return
-                }
-
-                await this.writeCustomRouteResponse(response, ctx.response.response)
-            })
+            )
         }
     }
 
@@ -98,81 +130,92 @@ export class AdonisMastraServer extends MastraServer<HttpRouterService, HttpCont
         const resolvedPrefix = prefix ?? this.prefix
         const fullPath = this.buildRoutePath(resolvedPrefix, route.path)
 
-        this.registerAdonisHandler(app, route.method, fullPath, async (ctx) => {
-            const runtime = this.createRuntimeContext(ctx)
-            const maxSize = route.maxBodySize ?? this.bodyLimitOptions?.maxSize
-            if (REQUEST_METHODS_WITH_BODY.has(route.method) && maxSize) {
-                const contentLength = ctx.request.header('content-length')
-                const parsedLength = contentLength ? Number.parseInt(contentLength, 10) : Number.NaN
+        this.registerAdonisHandler(
+            app,
+            route.method,
+            fullPath,
+            this.withMastraPipeline(
+                {
+                    requiresAuth: (route as { requiresAuth?: boolean }).requiresAuth,
+                },
+                async (ctx, runtime) => {
+                    const maxSize = route.maxBodySize ?? this.bodyLimitOptions?.maxSize
+                    if (REQUEST_METHODS_WITH_BODY.has(route.method) && maxSize) {
+                        const contentLength = ctx.request.header('content-length')
+                        const parsedLength = contentLength
+                            ? Number.parseInt(contentLength, 10)
+                            : Number.NaN
 
-                if (Number.isFinite(parsedLength) && parsedLength > maxSize) {
-                    const payload = this.bodyLimitOptions?.onError
-                        ? this.bodyLimitOptions.onError({ error: 'Request body too large' })
-                        : { error: 'Request body too large' }
+                        if (Number.isFinite(parsedLength) && parsedLength > maxSize) {
+                            const payload = this.bodyLimitOptions?.onError
+                                ? this.bodyLimitOptions.onError({ error: 'Request body too large' })
+                                : { error: 'Request body too large' }
 
-                    ctx.response.status(413)
-                    ctx.response.json(payload)
-                    return
+                            ctx.response.status(413)
+                            ctx.response.json(payload)
+                            return
+                        }
+                    }
+
+                    const params = await this.getParams(route, ctx)
+                    if (params.bodyParseError) {
+                        ctx.response.status(400)
+                        ctx.response.json({
+                            error: 'Invalid request body',
+                            issues: [{ field: 'body', message: params.bodyParseError.message }],
+                        })
+                        return
+                    }
+
+                    const pathParams = await this.parsePath(route, params.urlParams, ctx)
+                    if (!pathParams) {
+                        return
+                    }
+
+                    const queryParams = await this.parseQuery(route, params.queryParams, ctx)
+                    if (!queryParams) {
+                        return
+                    }
+
+                    const body = await this.parseRequestBody(route, params.body, ctx)
+                    if (body === null) {
+                        return
+                    }
+
+                    const handlerParams = {
+                        ...pathParams,
+                        ...queryParams,
+                        ...(typeof body === 'object' && true ? body : {}),
+                        mastra: this.mastra,
+                        requestContext: runtime.requestContext,
+                        registeredTools: runtime.registeredTools,
+                        taskStore: runtime.taskStore,
+                        abortSignal: runtime.abortSignal,
+                        routePrefix: resolvedPrefix,
+                    }
+
+                    try {
+                        const result = await route.handler(handlerParams)
+                        await this.sendResponse(route, ctx, result)
+                    } catch (error) {
+                        this.mastra.getLogger()?.error('Error calling Mastra route handler', {
+                            error:
+                                error instanceof Error
+                                    ? { message: error.message, stack: error.stack }
+                                    : error,
+                            path: route.path,
+                            method: route.method,
+                        })
+
+                        const status = this.resolveErrorStatus(error)
+                        ctx.response.status(status)
+                        ctx.response.json({
+                            error: error instanceof Error ? error.message : 'Unknown error',
+                        })
+                    }
                 }
-            }
-
-            const params = await this.getParams(route, ctx)
-            if (params.bodyParseError) {
-                ctx.response.status(400)
-                ctx.response.json({
-                    error: 'Invalid request body',
-                    issues: [{ field: 'body', message: params.bodyParseError.message }],
-                })
-                return
-            }
-
-            const pathParams = await this.parsePath(route, params.urlParams, ctx)
-            if (!pathParams) {
-                return
-            }
-
-            const queryParams = await this.parseQuery(route, params.queryParams, ctx)
-            if (!queryParams) {
-                return
-            }
-
-            const body = await this.parseRequestBody(route, params.body, ctx)
-            if (body === null) {
-                return
-            }
-
-            const handlerParams = {
-                ...pathParams,
-                ...queryParams,
-                ...(typeof body === 'object' && true ? body : {}),
-                mastra: this.mastra,
-                requestContext: runtime.requestContext,
-                registeredTools: runtime.registeredTools,
-                taskStore: runtime.taskStore,
-                abortSignal: runtime.abortSignal,
-                routePrefix: resolvedPrefix,
-            }
-
-            try {
-                const result = await route.handler(handlerParams)
-                await this.sendResponse(route, ctx, result)
-            } catch (error) {
-                this.mastra.getLogger()?.error('Error calling Mastra route handler', {
-                    error:
-                        error instanceof Error
-                            ? { message: error.message, stack: error.stack }
-                            : error,
-                    path: route.path,
-                    method: route.method,
-                })
-
-                const status = this.resolveErrorStatus(error)
-                ctx.response.status(status)
-                ctx.response.json({
-                    error: error instanceof Error ? error.message : 'Unknown error',
-                })
-            }
-        })
+            )
+        )
     }
 
     async getParams(route: ServerRoute, request: HttpContext): Promise<ParsedRequestParams> {
@@ -366,6 +409,198 @@ export class AdonisMastraServer extends MastraServer<HttpRouterService, HttpCont
         } finally {
             rawResponse.end()
         }
+    }
+
+    private withMastraPipeline(
+        route: { requiresAuth?: boolean },
+        handler: (
+            ctx: HttpContext,
+            runtime: ReturnType<AdonisMastraServer['createRuntimeContext']>
+        ) => Promise<void>
+    ) {
+        return async (ctx: HttpContext) => {
+            const runtime = this.createRuntimeContext(ctx)
+
+            const middlewareResponse = await this.runContextMiddlewares(ctx, runtime.requestContext)
+            if (middlewareResponse) {
+                await this.writeFetchResponse(ctx, middlewareResponse)
+                return
+            }
+
+            if (this.shouldCheckRouteAuth) {
+                const authFailure = await this.checkRouteAuth(
+                    { requiresAuth: route.requiresAuth } as ServerRoute,
+                    {
+                        path: ctx.request.url(),
+                        method: ctx.request.method(),
+                        getHeader: (name) => ctx.request.header(name) ?? undefined,
+                        getQuery: (name) => {
+                            const value = ctx.request.qs()[name]
+                            if (typeof value === 'string') {
+                                return value
+                            }
+                            if (Array.isArray(value) && typeof value[0] === 'string') {
+                                return value[0]
+                            }
+                            return undefined
+                        },
+                        requestContext: runtime.requestContext,
+                    }
+                )
+
+                if (authFailure) {
+                    ctx.response.status(authFailure.status)
+                    ctx.response.json({ error: authFailure.error })
+                    return
+                }
+            }
+
+            await handler(ctx, runtime)
+        }
+    }
+
+    private normalizeServerMiddlewares(): NormalizedMastraMiddleware[] {
+        const configured = this.mastra.getServer()?.middleware
+        if (!configured) {
+            return []
+        }
+
+        const list = Array.isArray(configured) ? configured : [configured]
+        return list.map((entry) => {
+            if (typeof entry === 'function') {
+                return {
+                    path: this.remapApiPathToPrefix('/api/*'),
+                    handler: entry as MastraMiddlewareHandler,
+                }
+            }
+
+            return {
+                path: this.remapApiPathToPrefix(entry.path || '/api/*'),
+                handler: entry.handler as MastraMiddlewareHandler,
+            }
+        })
+    }
+
+    private remapApiPathToPrefix(path: string): string {
+        const prefix = this.prefix || '/api'
+        if (!path.startsWith('/api')) {
+            return path
+        }
+
+        if (prefix === '/api') {
+            return path
+        }
+
+        return `${prefix}${path.slice('/api'.length)}`
+    }
+
+    private async runContextMiddlewares(
+        ctx: HttpContext,
+        requestContext: RequestContext
+    ): Promise<Response | null> {
+        const pathname = ctx.request.url()
+        const matched = this.contextMiddlewares.filter((middleware) =>
+            this.matchesMiddlewarePath(middleware.path, pathname)
+        )
+
+        if (matched.length === 0) {
+            return null
+        }
+
+        const state = new Map<string, unknown>()
+        state.set('mastra', this.mastra)
+        state.set('requestContext', requestContext)
+        if (this.customRouteAuthConfig) {
+            state.set('customRouteAuthConfig', this.customRouteAuthConfig)
+        }
+
+        const context = {
+            req: {
+                method: ctx.request.method(),
+                path: pathname,
+                query: (key: string) => {
+                    const value = ctx.request.qs()[key]
+                    if (typeof value === 'string') {
+                        return value
+                    }
+                    if (Array.isArray(value) && typeof value[0] === 'string') {
+                        return value[0]
+                    }
+                    return undefined
+                },
+                header: (name: string) => ctx.request.header(name) ?? undefined,
+            },
+            header: (name: string, value: string) => {
+                ctx.response.header(name, value)
+                const rawResponse = ctx.response.response as NodeResponseLike
+                rawResponse.setHeader?.(name, value)
+            },
+            set: (key: string, value: unknown) => {
+                state.set(key, value)
+            },
+            get: (key: string) => state.get(key),
+        }
+
+        const dispatch = async (index: number): Promise<Response | void> => {
+            const middleware = matched[index]
+            if (!middleware) {
+                return
+            }
+
+            return middleware.handler(context, async () => {
+                await dispatch(index + 1)
+            })
+        }
+
+        const result = await dispatch(0)
+        return result instanceof Response ? result : null
+    }
+
+    private matchesMiddlewarePath(pattern: string, pathname: string): boolean {
+        if (pattern === '*' || pattern === '/*') {
+            return true
+        }
+
+        if (pattern.endsWith('/*')) {
+            const prefix = pattern.slice(0, -1)
+            return pathname.startsWith(prefix)
+        }
+
+        if (pattern.endsWith('*')) {
+            const prefix = pattern.slice(0, -1)
+            return pathname.startsWith(prefix)
+        }
+
+        return pathname === pattern
+    }
+
+    private async writeFetchResponse(ctx: HttpContext, response: Response): Promise<void> {
+        response.headers.forEach((value, key) => {
+            ctx.response.header(key, value)
+        })
+        ctx.response.status(response.status)
+
+        if (response.body) {
+            const reader = response.body.getReader()
+            const rawResponse = ctx.response.response
+
+            try {
+                while (true) {
+                    const { done, value } = await reader.read()
+                    if (done) {
+                        break
+                    }
+
+                    rawResponse.write(value)
+                }
+            } finally {
+                rawResponse.end()
+            }
+
+            return
+        }
+
+        ctx.response.send(await response.text())
     }
 
     private registerAdonisHandler(
